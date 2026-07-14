@@ -61,6 +61,7 @@ jobs:
         env:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '2222' }}
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
@@ -68,19 +69,27 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           # Host key is scanned over the tailnet, which is already
           # WireGuard-authenticated end to end.
-          ssh-keyscan -T 20 "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          ssh-keyscan -T 20 -p "$DEPLOY_PORT" "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Deploy
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '2222' }}
         run: |
           set -euo pipefail
-          # No path here, deliberately. The server pins this SSH key to exactly
-          # one directory with an rrsync forced command in authorized_keys, and
-          # "/" means "the root of that jail". Isolation is enforced on the
-          # server, not by this file — which the site's owner can freely edit.
-          rsync -az --delete --checksum dist/ "$DEPLOY_USER@$DEPLOY_HOST:/"
+          # Port 2222, not 22, and that is load-bearing: Tailscale SSH intercepts
+          # port 22 and authenticates by tailnet identity, which would bypass
+          # authorized_keys entirely — and with it the rrsync jail. 2222 reaches
+          # the real sshd, where the forced command actually applies.
+          #
+          # No path below, deliberately. The key is pinned server-side to exactly
+          # one directory, and "/" means the root of that jail. Isolation is
+          # enforced on the server, not by this file — which the site's owner
+          # can freely edit.
+          rsync -az --delete --checksum \
+            -e "ssh -p $DEPLOY_PORT" \
+            dist/ "$DEPLOY_USER@$DEPLOY_HOST:/"
 
       # ---- Cloudflare cache
       # Purge-by-hostname is Enterprise-only, and purge_everything would blow away
