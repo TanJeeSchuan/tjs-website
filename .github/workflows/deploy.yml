@@ -1,0 +1,122 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # Job-level so that `if: env.CF_API_TOKEN != ''` can see it — a step cannot
+    # read its own `env:` block from its own `if:` condition.
+    env:
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- Read the one file that makes this site different from every other site
+      - name: Read site.config.json
+        id: site
+        run: |
+          set -euo pipefail
+          sub=$(jq -r '.subdomain' site.config.json)
+          # The subdomain becomes a filesystem path and a hostname. Validate it hard.
+          if ! [[ "$sub" =~ ^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$ ]]; then
+            echo "::error::Invalid subdomain '$sub' — must be lowercase letters, digits and hyphens."
+            exit 1
+          fi
+          echo "subdomain=$sub" >> "$GITHUB_OUTPUT"
+          echo "Deploying site: $sub"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # `npm run build` runs scripts/check-dist.mjs, so the guardrails
+      # (25 MB cap, extension allowlist) gate everything below. If they fail,
+      # we never reach Tailscale or rsync and the live site is untouched.
+      - name: Build (guardrails enforced here)
+        run: npm run build
+
+      # ---- Everything past this point only runs on a clean build
+      - name: Connect to tailnet
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Set up SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Host key is scanned over the tailnet, which is already
+          # WireGuard-authenticated end to end.
+          ssh-keyscan -T 20 "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Deploy
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          set -euo pipefail
+          # No path here, deliberately. The server pins this SSH key to exactly
+          # one directory with an rrsync forced command in authorized_keys, and
+          # "/" means "the root of that jail". Isolation is enforced on the
+          # server, not by this file — which the site's owner can freely edit.
+          rsync -az --delete --checksum dist/ "$DEPLOY_USER@$DEPLOY_HOST:/"
+
+      # ---- Cloudflare cache
+      # Purge-by-hostname is Enterprise-only, and purge_everything would blow away
+      # every other friend's cache. Vite content-hashes all assets, so the only
+      # files that can go stale are the entry HTML — purge those two URLs by name.
+      - name: Purge Cloudflare cache
+        if: ${{ env.CF_API_TOKEN != '' }}
+        env:
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          SITE_DOMAIN: ${{ secrets.SITE_DOMAIN }}
+          SUB: ${{ steps.site.outputs.subdomain }}
+        run: |
+          set -euo pipefail
+          host="$SUB.$SITE_DOMAIN"
+          response=$(curl -sS -X POST \
+            "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/purge_cache" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "{\"files\":[\"https://$host/\",\"https://$host/index.html\"]}")
+
+          if [ "$(echo "$response" | jq -r '.success')" != "true" ]; then
+            echo "::warning::Cache purge failed (the deploy itself succeeded):"
+            echo "$response" | jq -r '.errors'
+            exit 0
+          fi
+          echo "✓ Purged cache for https://$host/"
+
+      - name: Summary
+        env:
+          SUB: ${{ steps.site.outputs.subdomain }}
+          SITE_DOMAIN: ${{ secrets.SITE_DOMAIN }}
+        run: |
+          {
+            echo "### Deployed ✅"
+            echo ""
+            echo "**https://$SUB.$SITE_DOMAIN**"
+            echo ""
+            echo "\`$(du -sh dist | cut -f1)\` across \`$(find dist -type f | wc -l)\` files."
+          } >> "$GITHUB_STEP_SUMMARY"
